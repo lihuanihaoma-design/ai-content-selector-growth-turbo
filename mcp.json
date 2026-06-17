@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ai-content-growth-selector": {
+      "command": "python3",
+      "args": [
+        "mcp/content_highlights_server.py"
+      ]
+    }
+  }
+}

@@ -8,7 +8,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Local exports and generated award files
+# Local data and generated selection files
 outputs/
 exports/
 input/

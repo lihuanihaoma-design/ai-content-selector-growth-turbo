@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Select weekly or biweekly community highlight winners from exported xlsx files."""
+"""Select high-value content from large-scale local content datasets."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import html
+import json
 import math
 import re
 import sys
@@ -55,6 +56,8 @@ class Article:
     raw: dict[str, str]
     uid: str
     author: str
+    follower_count: float
+    content_url: str
     content_type: str
     title: str
     content: str
@@ -62,6 +65,7 @@ class Article:
     content_length: int
     primary_themes: list[str] = field(default_factory=list)
     secondary_themes: list[str] = field(default_factory=list)
+    preference_themes: list[str] = field(default_factory=list)
     score: float = 0.0
     pool: str = "excluded"
     status: str = "excluded"
@@ -220,11 +224,58 @@ def low_quality(article: Article) -> bool:
     return False
 
 
-def build_article(record: dict[str, str], source_file: str, source_row: int, priority_authors: set[str]) -> Article:
+def build_preference_themes(preferences: list[str]) -> dict[str, list[str]]:
+    return {value: [value] for value in preferences if value.strip()}
+
+
+def star_rating(score: float) -> str:
+    if score >= 48:
+        return "三星"
+    if score >= 28:
+        return "二星"
+    return "一星"
+
+
+def summarize_text(text: str, limit: int = 180) -> str:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def length_bucket(length: int) -> str:
+    if length >= 1200:
+        return "long"
+    if length >= 400:
+        return "medium"
+    return "short"
+
+
+def quality_reason(article: Article) -> str:
+    reasons = []
+    if article.preference_themes:
+        reasons.append("命中用户偏好主题")
+    if article.primary_themes:
+        reasons.append("具备核心主题相关性")
+    if article.content_length >= 400:
+        reasons.append("内容信息量较高")
+    if article.engagement > 0:
+        reasons.append("已有互动信号支撑")
+    return "；".join(reasons) or "通过基础质量过滤"
+
+
+def ai_comment(article: Article) -> str:
+    tags = "、".join(article.preference_themes + article.primary_themes + article.secondary_themes) or "泛内容"
+    return f"{star_rating(article.score)}内容，适合进入{article.status}；标签：{tags}。"
+
+
+def build_article(record: dict[str, str], source_file: str, source_row: int, preference_themes: dict[str, list[str]]) -> Article:
     title = pick(record, ["title", "标题", "文章标题", "内容标题"])
     content = pick(record, ["content", "正文", "内容", "文章内容", "post content", "body"])
     author = pick(record, ["author", "作者", "创作者", "昵称", "username", "user name"])
     uid = normalize_uid(pick(record, ["uid", "UID", "用户ID", "user id", "author uid"]))
+    follower_count = parse_number(pick(record, ["followers", "follower_count", "粉丝量", "粉丝数", "fans", "fans count"]))
+    content_url = pick(record, ["url", "content url", "content_url", "link", "链接", "内容链接", "文章链接"])
     content_type = pick(record, ["type", "类型", "内容类型", "文章类型", "post type"]) or "文章"
     engagement = sum(
         parse_number(pick(record, names))
@@ -242,6 +293,8 @@ def build_article(record: dict[str, str], source_file: str, source_row: int, pri
         raw=record,
         uid=uid,
         author=author,
+        follower_count=follower_count,
+        content_url=content_url,
         content_type=content_type,
         title=title,
         content=content,
@@ -250,6 +303,7 @@ def build_article(record: dict[str, str], source_file: str, source_row: int, pri
     )
     article.primary_themes = detect_themes(text, PRIMARY_THEMES)
     article.secondary_themes = detect_themes(text, SECONDARY_THEMES)
+    article.preference_themes = detect_themes(text, preference_themes)
     is_article = "文章" in content_type or content_type.lower() in {"article", "post"}
     is_dynamic = "动态" in content_type or content_type.lower() in {"dynamic", "short", "update"}
     if low_quality(article):
@@ -257,20 +311,20 @@ def build_article(record: dict[str, str], source_file: str, source_row: int, pri
         article.reason = "Excluded: short content or low-quality marker."
     elif is_article:
         article.pool = "main"
-        article.reason = "Main article pool."
+        article.reason = "Formal content pool candidate."
     elif is_dynamic and (article.primary_themes or article.secondary_themes) and article.content_length >= 180:
         article.pool = "supplemental"
-        article.reason = "Supplemental long-form dynamic pool."
+        article.reason = "Supplemental candidate pool."
     else:
         article.pool = "excluded"
         article.reason = "Excluded: unsupported content type."
     engagement_score = min(math.log1p(max(article.engagement, 0)), 6)
     article.score = (
         article.content_length / 120
+        + len(article.preference_themes) * 18
         + len(article.primary_themes) * 12
         + len(article.secondary_themes) * 5
         + engagement_score
-        + (2 if article.author in priority_authors else 0)
     )
     if article.pool == "supplemental":
         article.score -= 8
@@ -289,15 +343,9 @@ def select_articles(
     main = sorted([a for a in eligible if a.pool == "main"], key=sort_key)
     supplemental = sorted([a for a in eligible if a.pool == "supplemental"], key=sort_key)
     selected: list[Article] = []
-    used_authors: set[str] = set()
-
-    def take(article: Article, status: str) -> bool:
-        if article.author in used_authors:
-            return False
+    def take(article: Article, status: str) -> None:
         selected.append(article)
-        used_authors.add(article.author)
         article.status = status
-        return True
 
     focus_main = [a for a in main if a.primary_themes]
     other_main = [a for a in main if not a.primary_themes]
@@ -313,28 +361,26 @@ def select_articles(
     for article in supplemental:
         if len(selected) >= formal_count or dynamic_count >= max_dynamic_formal:
             break
-        if take(article, "formal"):
-            dynamic_count += 1
+        take(article, "formal")
+        dynamic_count += 1
 
     formal = selected[:formal_count]
     reserve: list[Article] = []
-    reserve_used = set(used_authors)
     dynamic_reserve = 0
     for article in other_main + focus_main + supplemental:
         if len(reserve) >= reserve_count:
             break
-        if article.author in reserve_used:
+        if article in formal:
             continue
         if article.pool == "supplemental" and dynamic_reserve >= max_dynamic_reserve:
             continue
-        article.status = "reserve"
+        article.status = "candidate"
         reserve.append(article)
-        reserve_used.add(article.author)
         if article.pool == "supplemental":
             dynamic_reserve += 1
     for article in articles:
         if article.status == "excluded" and article.pool in {"main", "supplemental"}:
-            article.reason = "Not selected after ranking and one-award-per-author cap."
+            article.reason = "Not selected after ranking and pool limits."
     return formal, reserve
 
 
@@ -349,15 +395,77 @@ def article_row(article: Article) -> dict[str, str | int | float]:
         "score": round(article.score, 3),
         "uid": article.uid,
         "author": article.author,
+        "follower_count": round(article.follower_count, 3),
+        "content_url": article.content_url,
         "type": article.content_type,
         "title": article.title,
         "content_length": article.content_length,
+        "tags": "; ".join(article.preference_themes + article.primary_themes + article.secondary_themes),
+        "star_rating": star_rating(article.score),
+        "preference_themes": "; ".join(article.preference_themes),
         "primary_themes": "; ".join(article.primary_themes),
         "secondary_themes": "; ".join(article.secondary_themes),
         "engagement": round(article.engagement, 3),
+        "quality_reason": quality_reason(article),
+        "comment": ai_comment(article),
+        "summary": summarize_text(article.content),
         "source_file": article.source_file,
         "source_row": article.source_row,
         "reason": article.reason,
+    }
+
+
+def quality_content_row(article: Article) -> dict[str, str | int | float]:
+    return {
+        "UID": article.uid,
+        "nickname": article.author,
+        "followers": round(article.follower_count, 3),
+        "content_url": article.content_url,
+        "title": article.title,
+        "pool": article.status,
+        "star_rating": star_rating(article.score),
+        "quality_score": round(article.score, 3),
+        "quality_reason": quality_reason(article),
+        "comment": ai_comment(article),
+        "summary": summarize_text(article.content),
+    }
+
+
+def recommendation_feature_row(article: Article, date_label: str) -> dict[str, str | int | float]:
+    tags = article.preference_themes + article.primary_themes + article.secondary_themes
+    return {
+        "item_id": article.content_url or f"{article.source_file}:{article.source_row}",
+        "content_url": article.content_url,
+        "creator_id": article.uid,
+        "creator_nickname": article.author,
+        "creator_followers": round(article.follower_count, 3),
+        "content_type": article.content_type,
+        "title": article.title,
+        "summary": summarize_text(article.content),
+        "topic_tags": "|".join(tags),
+        "preference_tags": "|".join(article.preference_themes),
+        "quality_score": round(article.score, 3),
+        "star_rating": star_rating(article.score),
+        "engagement_score": round(article.engagement, 3),
+        "content_length": article.content_length,
+        "content_length_bucket": length_bucket(article.content_length),
+        "candidate_pool": article.status,
+        "cold_start_candidate": "true" if article.status == "formal" and star_rating(article.score) in {"二星", "三星"} else "false",
+        "distribution_goal": "growth_seed" if article.preference_themes else "quality_recall",
+        "retrieval_keywords": "|".join(tags + [article.title]),
+        "context_date_label": date_label,
+        "ranking_features_json": json.dumps(
+            {
+                "quality_score": round(article.score, 3),
+                "engagement_score": round(article.engagement, 3),
+                "content_length": article.content_length,
+                "creator_followers": round(article.follower_count, 3),
+                "preference_match_count": len(article.preference_themes),
+                "topic_match_count": len(article.primary_themes) + len(article.secondary_themes),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -462,15 +570,15 @@ def write_xlsx(path: Path, headers: list[str], rows: list[list[object]]) -> None
             zf.writestr(name, content)
 
 
-def load_priority_authors(args: argparse.Namespace) -> set[str]:
-    authors = {value.strip() for value in args.priority_author if value.strip()}
-    if args.priority_authors_file:
-        path = Path(args.priority_authors_file)
+def load_preferences(args: argparse.Namespace) -> list[str]:
+    preferences = [value.strip() for value in args.preference if value.strip()]
+    if args.preferences_file:
+        path = Path(args.preferences_file)
         for line in path.read_text(encoding="utf-8").splitlines():
             text = line.strip()
             if text and not text.startswith("#"):
-                authors.add(text)
-    return authors
+                preferences.append(text)
+    return preferences
 
 
 def write_summary(path: Path, args: argparse.Namespace, articles: list[Article], formal: list[Article], reserve: list[Article]) -> None:
@@ -479,58 +587,57 @@ def write_summary(path: Path, args: argparse.Namespace, articles: list[Article],
     focus = len([a for a in formal if a.primary_themes])
     dynamic = len([a for a in formal if a.pool == "supplemental"])
     lines = [
-        f"# Community Highlights Selection Summary",
+        f"# AI Content Selection Summary",
         "",
         f"- Date label: {args.date_label or 'not provided'}",
         f"- Input files: {len(args.input)}",
         f"- Total rows scored: {total}",
         f"- Eligible rows: {eligible}",
-        f"- Formal winners: {len(formal)}",
-        f"- Reserve candidates: {len(reserve)}",
+        f"- Formal pool size: {len(formal)}",
+        f"- Candidate pool size: {len(reserve)}",
         f"- Formal focus-theme count: {focus}",
         f"- Formal supplemental dynamic count: {dynamic}",
         "",
-        "## Formal Winners",
+        "## Formal Pool",
         "",
-        "| Rank | Author | UID | Type | Title | Themes | Score |",
+        "| Rank | Author | UID | Type | Title | Stars | Themes | Score |",
         "| ---: | --- | --- | --- | --- | --- | ---: |",
     ]
     for index, article in enumerate(formal, start=1):
-        themes = "; ".join(article.primary_themes + article.secondary_themes)
+        themes = "; ".join(article.preference_themes + article.primary_themes + article.secondary_themes)
         lines.append(
             f"| {index} | {article.author} | {article.uid} | {article.content_type} | "
-            f"{article.title.replace('|', '/')} | {themes} | {article.score:.2f} |"
+            f"{article.title.replace('|', '/')} | {star_rating(article.score)} | {themes} | {article.score:.2f} |"
         )
     lines.extend(
         [
             "",
             "## Notes",
             "",
-            "- One award per author is enforced before reserve selection.",
             "- Engagement is treated as a supporting signal, not the deciding metric.",
-            "- Priority authors only receive a light tie-breaker.",
-            "- Tables with more than 100 article rows should be processed by this script before any row-level inspection.",
+            "- Preference themes act as high-priority relevance signals.",
+            "- Datasets with more than 100 rows should be processed by this script before any row-level inspection.",
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Select community highlight winners from exported .xlsx article tables.")
+    parser = argparse.ArgumentParser(
+        description="Select high-value content from large-scale local content datasets.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--input", action="append", required=True, help="Input .xlsx file. Repeat for multiple weeks.")
     parser.add_argument("--output-prefix", required=True, help="Prefix for generated output files.")
     parser.add_argument("--date-label", default="", help="Human-readable date range, for example 6.1-6.14.")
     parser.add_argument("--workdir", default=".", help="Output directory.")
     parser.add_argument("--formal-count", type=int, default=30)
-    parser.add_argument("--reserve-count", type=int, default=10)
+    parser.add_argument("--candidate-count", dest="reserve_count", metavar="CANDIDATE_COUNT", type=int, default=10)
     parser.add_argument("--target-focus-count", type=int, default=22)
     parser.add_argument("--max-dynamic-formal", type=int, default=4)
-    parser.add_argument("--max-dynamic-reserve", type=int, default=3)
-    parser.add_argument("--reward-amount", default="30")
-    parser.add_argument("--english-application", default="Community weekly highlight reward")
-    parser.add_argument("--chinese-application", default="观点社区周精选文章奖励")
-    parser.add_argument("--priority-author", action="append", default=[])
-    parser.add_argument("--priority-authors-file")
+    parser.add_argument("--max-dynamic-candidate", dest="max_dynamic_reserve", metavar="MAX_DYNAMIC_CANDIDATE", type=int, default=3)
+    parser.add_argument("--preference", action="append", default=[], help="Preference topic such as US stocks, AI storage, or Crypto. Repeatable.")
+    parser.add_argument("--preferences-file", help="Optional text file with one preference topic per line.")
     return parser.parse_args(argv)
 
 
@@ -538,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    priority_authors = load_priority_authors(args)
+    preference_themes = build_preference_themes(load_preferences(args))
     articles: list[Article] = []
     for input_file in args.input:
         path = Path(input_file)
@@ -546,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
         if not headers:
             continue
         for index, record in enumerate(records, start=2):
-            articles.append(build_article(record, path.name, index, priority_authors))
+            articles.append(build_article(record, path.name, index, preference_themes))
     formal, reserve = select_articles(
         articles,
         args.formal_count,
@@ -561,39 +668,73 @@ def main(argv: list[str] | None = None) -> int:
         "score",
         "uid",
         "author",
+        "follower_count",
+        "content_url",
         "type",
         "title",
         "content_length",
+        "tags",
+        "star_rating",
+        "preference_themes",
         "primary_themes",
         "secondary_themes",
         "engagement",
+        "quality_reason",
+        "comment",
+        "summary",
         "source_file",
         "source_row",
         "reason",
     ]
     all_rows = [article_row(article) for article in sorted(articles, key=sort_key)]
-    formal_rows = [article_row(article) for article in formal]
-    reserve_rows = [article_row(article) for article in reserve]
+    selected_articles = formal + reserve
+    quality_headers = [
+        "UID",
+        "nickname",
+        "followers",
+        "content_url",
+        "title",
+        "pool",
+        "star_rating",
+        "quality_score",
+        "quality_reason",
+        "comment",
+        "summary",
+    ]
+    feature_headers = [
+        "item_id",
+        "content_url",
+        "creator_id",
+        "creator_nickname",
+        "creator_followers",
+        "content_type",
+        "title",
+        "summary",
+        "topic_tags",
+        "preference_tags",
+        "quality_score",
+        "star_rating",
+        "engagement_score",
+        "content_length",
+        "content_length_bucket",
+        "candidate_pool",
+        "cold_start_candidate",
+        "distribution_goal",
+        "retrieval_keywords",
+        "context_date_label",
+        "ranking_features_json",
+    ]
+    quality_rows = [quality_content_row(article) for article in selected_articles]
+    feature_rows = [recommendation_feature_row(article, args.date_label) for article in selected_articles]
     prefix = args.output_prefix
     write_csv(workdir / f"{prefix}_all_scored.csv", all_rows, headers)
-    write_csv(workdir / f"{prefix}_formal.csv", formal_rows, headers)
-    write_csv(workdir / f"{prefix}_reserve.csv", reserve_rows, headers)
-    write_xlsx(workdir / f"{prefix}_formal_list.xlsx", headers, [[row[h] for h in headers] for row in formal_rows])
-    reward_headers = ["UID", "currency", "amount", "APPLICATION NUMBER"]
-    reward_rows = [
-        [
-            article.uid,
-            "USDT",
-            args.reward_amount,
-            args.chinese_application if is_chinese_name(article.author) else args.english_application,
-        ]
-        for article in formal
-    ]
-    write_xlsx(workdir / f"{prefix}_reward_flow_submit.xlsx", reward_headers, reward_rows)
+    write_csv(workdir / f"{prefix}_quality_content.csv", quality_rows, quality_headers)
+    write_xlsx(workdir / f"{prefix}_quality_content.xlsx", quality_headers, [[row[h] for h in quality_headers] for row in quality_rows])
+    write_csv(workdir / f"{prefix}_recommendation_features.csv", feature_rows, feature_headers)
     write_summary(workdir / f"{prefix}_summary.md", args, articles, formal, reserve)
     print(f"Scored {len(articles)} rows.")
-    print(f"Formal winners: {len(formal)}")
-    print(f"Reserve candidates: {len(reserve)}")
+    print(f"Formal pool: {len(formal)}")
+    print(f"Candidate pool: {len(reserve)}")
     print(f"Outputs written to: {workdir.resolve()}")
     return 0
 

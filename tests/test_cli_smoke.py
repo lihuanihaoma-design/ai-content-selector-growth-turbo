@@ -1,5 +1,6 @@
 import csv
 import importlib.util
+import json
 import subprocess
 import sys
 import unittest
@@ -9,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "select_biweekly_highlights.py"
+MCP_SCRIPT = ROOT / "mcp" / "content_highlights_server.py"
 
 
 def load_tool():
@@ -73,7 +75,7 @@ class CliSmokeTest(unittest.TestCase):
                     str(tmp_path),
                     "--formal-count",
                     "2",
-                    "--reserve-count",
+                    "--candidate-count",
                     "1",
                 ],
                 check=True,
@@ -81,28 +83,64 @@ class CliSmokeTest(unittest.TestCase):
             )
 
             expected = [
-                tmp_path / f"{prefix}_formal_list.xlsx",
-                tmp_path / f"{prefix}_reward_flow_submit.xlsx",
+                tmp_path / f"{prefix}_quality_content.xlsx",
                 tmp_path / f"{prefix}_summary.md",
-                tmp_path / f"{prefix}_reserve.csv",
+                tmp_path / f"{prefix}_quality_content.csv",
+                tmp_path / f"{prefix}_recommendation_features.csv",
                 tmp_path / f"{prefix}_all_scored.csv",
-                tmp_path / f"{prefix}_formal.csv",
             ]
             for path in expected:
                 self.assertTrue(path.exists(), path)
 
-            with (tmp_path / f"{prefix}_formal.csv").open(encoding="utf-8-sig", newline="") as handle:
-                formal = list(csv.DictReader(handle))
-            self.assertEqual(len(formal), 2)
-            self.assertEqual({row["author"] for row in formal}, {"张三", "Alice"})
+            with (tmp_path / f"{prefix}_quality_content.csv").open(encoding="utf-8-sig", newline="") as handle:
+                quality = list(csv.DictReader(handle))
+            self.assertEqual(len(quality), 3)
+            self.assertIn("UID", quality[0])
+            self.assertIn("nickname", quality[0])
+            self.assertIn("followers", quality[0])
+            self.assertIn("content_url", quality[0])
+            self.assertIn("quality_reason", quality[0])
+            self.assertIn("comment", quality[0])
+            self.assertIn("summary", quality[0])
 
-            with zipfile.ZipFile(tmp_path / f"{prefix}_reward_flow_submit.xlsx") as archive:
+            with (tmp_path / f"{prefix}_recommendation_features.csv").open(encoding="utf-8-sig", newline="") as handle:
+                features = list(csv.DictReader(handle))
+            self.assertIn("topic_tags", features[0])
+            self.assertIn("ranking_features_json", features[0])
+            self.assertIn(features[0]["star_rating"], {"一星", "二星", "三星"})
+
+            with zipfile.ZipFile(tmp_path / f"{prefix}_quality_content.xlsx") as archive:
                 sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
-            self.assertIn("UID", sheet)
-            self.assertIn("currency", sheet)
-            self.assertIn("amount", sheet)
-            self.assertIn("APPLICATION NUMBER", sheet)
+            self.assertIn("star_rating", sheet)
             self.assertIn("123450", sheet)
+
+    def test_defaults_are_public_safe(self):
+        help_text = subprocess.run(
+            [sys.executable, str(SCRIPT), "--help"],
+            check=True,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        ).stdout
+        self.assertIn("--preference", help_text)
+        self.assertIn("--candidate-count", help_text)
+
+    def test_mcp_tools_list(self):
+        request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}) + "\n"
+        result = subprocess.run(
+            [sys.executable, str(MCP_SCRIPT)],
+            input=request,
+            text=True,
+            capture_output=True,
+            cwd=ROOT,
+            check=True,
+        )
+        payload = json.loads(result.stdout.strip())
+        names = {tool["name"] for tool in payload["result"]["tools"]}
+        self.assertGreaterEqual(
+            names,
+            {"select_highlights", "inspect_summary", "validate_outputs", "preview_scored_csv"},
+        )
 
 
 if __name__ == "__main__":

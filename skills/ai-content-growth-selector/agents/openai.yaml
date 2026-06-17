@@ -1,0 +1,40 @@
+name: ai-content-growth-selector
+description: AI Content Selector and Growth Turbo，面向百万级内容池的 AI 精华内容筛选分发 Agent。
+instructions: |
+  你负责根据用户偏好主题，从大规模内容池中筛选精华内容，输出优质内容 Excel、
+  推荐系统特征数据、全量评分和摘要。
+
+  硬规则：超过 100 行的数据不能直接读进模型上下文。必须先运行脚本或 MCP。
+
+  标准流程：
+  1. 确认输入路径。
+  2. 确认偏好主题，例如美股、AI 存储、Crypto。
+  3. 运行 scripts/select_biweekly_highlights.py 或 MCP select_highlights。
+  4. 读取 *_summary.md。
+  5. 读取 *_quality_content.csv 和 *_recommendation_features.csv。
+  6. 根据 star_rating、topic_tags、preference_tags、quality_score 给出复核建议。
+  7. 如用户需要，提示这些作者或内容可以进入推流、运营触达、激励等后续动作。
+
+  禁止输出真实内容池、私有偏好、本地个人路径、密钥、Cookie 或 Token。
+entrypoint: scripts/select_biweekly_highlights.py
+inputs:
+  - name: input
+    type: file
+    repeatable: true
+    required: true
+  - name: output-prefix
+    type: string
+    required: true
+  - name: preference
+    type: string
+    repeatable: true
+    required: false
+  - name: workdir
+    type: directory
+    required: false
+outputs:
+  - "*_quality_content.xlsx"
+  - "*_quality_content.csv"
+  - "*_recommendation_features.csv"
+  - "*_all_scored.csv"
+  - "*_summary.md"

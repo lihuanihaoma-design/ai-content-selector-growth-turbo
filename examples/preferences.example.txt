@@ -1,0 +1,8 @@
+# Preference topics, one per line.
+# Examples:
+美股
+AI storage
+Crypto
+DeFi
+ETF
+宏观
