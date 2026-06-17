@@ -1,0 +1,31 @@
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db
+
+# Local exports and generated award files
+outputs/
+exports/
+input/
+private/
+*.xlsx
+*.csv
+*_summary.md
+!examples/
+!examples/*.example.txt
+
+# Keep source and docs tracked
+!README.md
+!UPLOAD.md
+!scripts/
+!scripts/*.py
+!skills/
+!skills/**/*.md
+!skills/**/*.yaml
+!tests/
+!tests/*.py
